@@ -360,16 +360,6 @@ make_contention_site_invalid(bthread_contention_site_t* cs) {
     cs->sampling_range = 0;
 }
 
-// Replace pthread_mutex_lock and pthread_mutex_unlock:
-// First call to sys_pthread_mutex_lock sets sys_pthread_mutex_lock to the
-// real function so that next calls go to the real function directly. This
-// technique avoids calling pthread_once each time.
-typedef int (*MutexOp)(pthread_mutex_t*);
-int first_sys_pthread_mutex_lock(pthread_mutex_t* mutex);
-int first_sys_pthread_mutex_unlock(pthread_mutex_t* mutex);
-static MutexOp sys_pthread_mutex_lock = first_sys_pthread_mutex_lock;
-static MutexOp sys_pthread_mutex_unlock = first_sys_pthread_mutex_unlock;
-static pthread_once_t init_sys_mutex_lock_once = PTHREAD_ONCE_INIT;
 
 // dlsym may call malloc to allocate space for dlerror and causes contention
 // profiler to deadlock at boostraping when the program is linked with
@@ -400,23 +390,7 @@ static pthread_once_t init_sys_mutex_lock_once = PTHREAD_ONCE_INIT;
 //   #23 0x00000000006fbb9a in tc_malloc ()
 // Call _dl_sym which is a private function in glibc to workaround the malloc
 // causing deadlock temporarily. This fix is hardly portable.
-// FIXME: had to revert _dl_sym() usage to support glibc 2.34 which has stopped exporting this symbol publicly
-static void init_sys_mutex_lock() {
-    sys_pthread_mutex_lock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_lock");
-    sys_pthread_mutex_unlock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_unlock");
-}
-
-// Make sure pthread functions are ready before main().
-const int ALLOW_UNUSED dummy = pthread_once(&init_sys_mutex_lock_once, init_sys_mutex_lock);
-
-int first_sys_pthread_mutex_lock(pthread_mutex_t* mutex) {
-    pthread_once(&init_sys_mutex_lock_once, init_sys_mutex_lock);
-    return sys_pthread_mutex_lock(mutex);
-}
-int first_sys_pthread_mutex_unlock(pthread_mutex_t* mutex) {
-    pthread_once(&init_sys_mutex_lock_once, init_sys_mutex_lock);
-    return sys_pthread_mutex_unlock(mutex);
-}
+// FIXME: glibc 2.34 no longer exports `_dl_sym` publicly so remove overriding for now
 
 inline uint64_t hash_mutex_ptr(const pthread_mutex_t* m) {
     return butil::fmix64((uint64_t)m);
@@ -504,100 +478,6 @@ void submit_contention(const bthread_contention_site_t& csite, int64_t now_ns) {
     sc->nframes = backtrace(sc->stack, arraysize(sc->stack)); // may lock
     sc->submit(now_ns / 1000);  // may lock
     tls_inside_lock = false;
-}
-
-BUTIL_FORCE_INLINE int pthread_mutex_lock_impl(pthread_mutex_t* mutex) {
-    // Don't change behavior of lock when profiler is off.
-    if (!g_cp ||
-        // collecting code including backtrace() and submit() may call
-        // pthread_mutex_lock and cause deadlock. Don't sample.
-        tls_inside_lock) {
-        return sys_pthread_mutex_lock(mutex);
-    }
-    // Don't slow down non-contended locks.
-    int rc = pthread_mutex_trylock(mutex);
-    if (rc != EBUSY) {
-        return rc;
-    }
-    // Ask bvar::Collector if this (contended) locking should be sampled
-    const size_t sampling_range = bvar::is_collectable(&g_cp_sl);
-
-    bthread_contention_site_t* csite = NULL;
-#ifndef DONT_SPEEDUP_PTHREAD_CONTENTION_PROFILER_WITH_TLS
-    TLSPthreadContentionSites& fast_alt = tls_csites;
-    if (fast_alt.cp_version != g_cp_version) {
-        fast_alt.cp_version = g_cp_version;
-        fast_alt.count = 0;
-    }
-    if (fast_alt.count < TLS_MAX_COUNT) {
-        MutexAndContentionSite& entry = fast_alt.list[fast_alt.count++];
-        entry.mutex = mutex;
-        csite = &entry.csite;
-        if (!sampling_range) {
-            make_contention_site_invalid(&entry.csite);
-            return sys_pthread_mutex_lock(mutex);
-        }
-    }
-#endif
-    if (!sampling_range) {  // don't sample
-        return sys_pthread_mutex_lock(mutex);
-    }
-    // Lock and monitor the waiting time.
-    const int64_t start_ns = butil::cpuwide_time_ns();
-    rc = sys_pthread_mutex_lock(mutex);
-    if (!rc) { // Inside lock
-        if (!csite) {
-            csite = add_pthread_contention_site(mutex);
-            if (csite == NULL) {
-                return rc;
-            }
-        }
-        csite->duration_ns = butil::cpuwide_time_ns() - start_ns;
-        csite->sampling_range = sampling_range;
-    } // else rare
-    return rc;
-}
-
-BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(pthread_mutex_t* mutex) {
-    // Don't change behavior of unlock when profiler is off.
-    if (!g_cp || tls_inside_lock) {
-        // This branch brings an issue that an entry created by
-        // add_pthread_contention_site may not be cleared. Thus we add a 
-        // 16-bit rolling version in the entry to find out such entry.
-        return sys_pthread_mutex_unlock(mutex);
-    }
-    int64_t unlock_start_ns = 0;
-    bool miss_in_tls = true;
-    bthread_contention_site_t saved_csite = {0,0};
-#ifndef DONT_SPEEDUP_PTHREAD_CONTENTION_PROFILER_WITH_TLS
-    TLSPthreadContentionSites& fast_alt = tls_csites;
-    for (int i = fast_alt.count - 1; i >= 0; --i) {
-        if (fast_alt.list[i].mutex == mutex) {
-            if (is_contention_site_valid(fast_alt.list[i].csite)) {
-                saved_csite = fast_alt.list[i].csite;
-                unlock_start_ns = butil::cpuwide_time_ns();
-            }
-            fast_alt.list[i] = fast_alt.list[--fast_alt.count];
-            miss_in_tls = false;
-            break;
-        }
-    }
-#endif
-    // Check the map to see if the lock is sampled. Notice that we're still
-    // inside critical section.
-    if (miss_in_tls) {
-        if (remove_pthread_contention_site(mutex, &saved_csite)) {
-            unlock_start_ns = butil::cpuwide_time_ns();
-        }
-    }
-    const int rc = sys_pthread_mutex_unlock(mutex);
-    // [Outside lock]
-    if (unlock_start_ns) {
-        const int64_t unlock_end_ns = butil::cpuwide_time_ns();
-        saved_csite.duration_ns += unlock_end_ns - unlock_start_ns;
-        submit_contention(saved_csite, unlock_end_ns);
-    }
-    return rc;
 }
 
 // Implement bthread_mutex_t related functions
@@ -795,13 +675,6 @@ int bthread_mutex_unlock(bthread_mutex_t* m) {
     saved_csite.duration_ns += unlock_end_ns - unlock_start_ns;
     bthread::submit_contention(saved_csite, unlock_end_ns);
     return 0;
-}
-
-int pthread_mutex_lock (pthread_mutex_t *__mutex) {
-    return bthread::pthread_mutex_lock_impl(__mutex);
-}
-int pthread_mutex_unlock (pthread_mutex_t *__mutex) {
-    return bthread::pthread_mutex_unlock_impl(__mutex);
 }
 
 }  // extern "C"
